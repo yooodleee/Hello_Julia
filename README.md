@@ -1,2 +1,1 @@
-# Hello-Julia-
-🖐️Nice to meet you, Julia!🖐️
+## **Hello_Julia!**
