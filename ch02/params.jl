@@ -6,13 +6,13 @@
     입력할 수 있다. 밑줄 문자 _(under score)는 변수명에 쓸 수 있다. your_name이나 airspeed_of_unladen_swallow
     처럼 일반적으로 여러 단어로 된 변수명에 쓴다. 변수명을 잘못 쓰면 구문 오류(syntax error)가 발생한다.
 """
-76trombondes = "big parade"
+# 76trombondes = "big parade"
 
 # ERROR: LoadError: syntax: "76" is not a valid function argument name 
 
-@more = 10000000
+# @more = 10000000
 
-struct = "Advanced Theoretical Zymurgy"
+# struct = "Advanced Theoretical Zymurgy"
 
 """
 76trombondes는 숫자로 시작하기 때문에 잘못되었다.
