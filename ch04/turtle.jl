@@ -15,3 +15,25 @@
 
 # (v1.0) pkg> add https://github.com/BenLauwens/ThinkJulia.jl
 
+"""
+모듈에 있는 함수를 사용하기 위해서는 using 명령문으로 모듈을 먼저 가져와야 한다.
+"""
+
+using ThinkJulia
+
+a = Turtle()
+
+"""
+ThinkJulia 모듈은 a.Turtle 객체를 만들어주는 Turtle 함수를 제공한다. 여기서 우리는 그 객체를 변수 a에 할당한다.
+"""
+
+🐢 = Turtle()
+# Luxor.Turtle()
+
+"""
+거북이(turtle)가 만들어졌다면, 함수를 호출해 거북이를 움직일 수 있다. 예컨대 거북이를 전진시키려면 다음과 같이 한다.
+"""
+
+@svg begin
+    forward(🐢, 100)
+end
