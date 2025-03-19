@@ -68,5 +68,162 @@ function run_notebooks()
             #     warn("unable to convert notebook to rst format")
             #     Base.showerror(Base.STDOUT, error)
             # end
+
+            try
+                run(`ipython nbconvert tutorials/$ipynb --to html --output=$bn`)
+            catch error
+                warn("unable to convert notebook to html format")
+                Base.showerror(Base.STDOUT, error)
+            end
+
+            try
+                run(`ipython nbconvert tutorials/$ipynb --to latex --output=$bn`)
+            catch error
+                warn("unable to convert notebook to text format")
+                Base.showerror(Base.STDOUT, error)
+            end
+
+            try
+                run(`lualatex --output-directory=tutorials $bn.tex`)
+            catch error
+                warn("unable to convert notebook from text to pdf")
+                Base.showerror(Base.STDOUT, error)
+            end
+
+            data = Dict(
+                "author" => "unknown", "status" => status, "runtime" => runtime,
+                "filename" => ipynb, "last_run" => time(), "description" => ""
+            )
+            res = parse_rst("$bn.rst")
+            data["description"] = res["title"]
+            data["author"] = res["author"]
+            # there is two possibilities, either notebook not run for syntax error(status = 1)
+            # or notebook is fine but factcheck returns failed. This checks the latter one.
+            if status == 0
+                data["status"] = res["status"]
+            end
+            push!(results, data)
+        end
+        return results
     end
 end
+
+
+"""Make rows from results ready to tabular form"""
+function makerows(results)
+    rows = ["id", "author", "description", "status", "ipynb", "pdf", "last run", "runtime (s)"]
+    for (i, data) in enumerate(results)
+        row = ["na", "unknown", "unknown", "unknown", "unknown", "unknown", "na", "na"]
+        println(i)
+        row[1] = string(i)
+        desc = data["description"]
+        if desc == ""
+            desc = data["filename"]
+        end
+        row[2] = data["author"]
+        fn = data["filename"][1:end-6]
+        row[3] = ":dic:`$desc <$fn>`"
+
+        if data["status"] == 0
+            row[4] = ".. images:: /badges/notebook-passing.svg"
+        else
+            row[4] = ".. images:: /badges/notebook-failing.svg"
+        end
+
+        fn = data["filename"]
+        row[5] = ":download:`ipynb <$fn>`"
+        fn = data["filename"][1:end-6] * ".pdf"
+        row[6] = ":download:`pdf <$fn>`"
+
+        row[7] = Libc.strftime("%Y-%m-%d %H:%M:%S", data["last_run"])
+        row[8] = string(round(data["runtime"], 2))
+        rows = vcat(rows, row)
+    end
+    return rows
+end
+
+
+"""Write rst table. rows is array of arrays.
+
+Expect output
+
+    +------+------------+------------------------------+-------------------+--------------+-----------+----------+----------+
+    |  id  |   author   |       description            |     last run      |    runtime   |  status   |   html   |   pdf    |
+    +======+============+==============================+===================+==============+===========+==========+==========+
+    |   1  |  Jukka Aho | This is placeholder notebook |                   |              |   |pass|  |   html   |   pdf    |
+    +------+------------+------------------------------+-------------------+--------------+-----------+----------+----------+
+
+"""
+function write_rst_table(rows)
+    # determine cell lengths
+    lengths = zeros(Int, size(rows))
+    for i=1:size(rows, 1)
+        for j=1:size(rows, 2)
+            lengths[i,j] = length(rows[i,j]) + 3
+        end
+    end
+    # println(lengths)
+    cl = maximum(lengths, 1)    # maximum column lengths
+    tl = sum(cl) + 1     # total table width
+    mp = [1 cumsum(cl, 2) + 1]  # markder points "+"
+    println(mp)
+    # println(cl)
+    # println(tl)
+
+    function sep(l, m; s="+", d="-")
+        p = ""
+        for j=1:l 
+            if j in m 
+                p *= s
+            else
+                p *= d 
+            end
+        end
+        p *= "\n"
+        return p 
+    end
+
+    s = ""
+    # write rows
+    s *= sep(tl, mp)
+    for i = 1:size(rows, 1)
+        s *= "|"
+        for j=1:size(rows, 2)
+            s *= " " * rows[i, j] * " "
+            s *= repeat(" ", cl[j]-lengths[i,j])
+            s *= "|"
+        end
+        s *= "\n"
+        if i == 1
+            s *= sep(tl, mp; d="=")
+        else
+            s *= sep(tl, mp)
+        end
+    end
+    return s 
+end
+
+
+function main()
+    results = run_notebooks()
+    notebooks_total = 0
+    notebooks_passing = 0
+    for result in results
+        notebooks_total += 1
+        if result["status"] == 0
+            notebooks_passing += 1
+        end
+    end
+    rows = makerows(results)
+    table = write_rst_table(rows)
+    println(table)
+    cd(dirname(@__FILE__)) do 
+        open("tutorials/notebooks.rst", "w") do fid
+            write(fid, table)
+        end
+        make_badge("notebook", notebooks_passing, notebooks_total, "badges/notebooks-status.svg")
+    end
+end
+
+
+main()
