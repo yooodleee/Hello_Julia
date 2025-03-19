@@ -155,3 +155,112 @@ function generate_packages()
     copy_docs("UMAT")                   && add_page!(PACKAGES, "UMAT/index.md")
     return PACKAGES
 end
+
+
+"""
+    license_stripper(s)
+
+Strip license strings away from source file.
+"""
+function license_stripper(s)
+    # return replace(s, r"# This file is a part of JuliaFEM.*?\n\n"sm, "")
+    lines = split(s, '\n')
+    function myflit(line)
+        occursin(line, "# This file is a part of JuliaFEM.") && return false
+        occursin(line, "# License is MIT") && return false
+        return true
+    end
+    new_s = join(filter(myflit, lines), '\n')
+    return new_s
+end
+
+
+"""
+    generate_example(example_src, dst_dir)
+
+Given excutable Julia script file, use Literate.jl to render file to Markdown
+file. If there exists a directory with the same name than script, but without
+extension, it will be copied to destination also. Function returns a path to
+the generated example file 
+
+# Example 
+
+If `example_src` is `examples/my_example_analysis.jl`, and there exists a 
+directory `example/my_example_analysis`, there will be a rendered file 
+`dst_dir/my_example_analysis.md` and additional directory
+`dst_dir/my_example_analysis` containing complementary materail like mesh,
+result files and so on.
+"""
+function generate_example(example_src, dst_dir)
+    dst_file = Literate.markdown(example_src, dst_dir;
+                                documenter=true,
+                                preprocess=license_stripper)
+    
+    # ex_dir = directory for complementary materail
+    complementary_dir = first(splitext(basename(example_src)))
+    src_ex_dir = joinpath(juliafem_dir, "examples", complementary_dir)
+    dst_ex_dir = joinpath(dst_dir, complementary_dir)
+    if isdir(src_ex_dir) && !isdir(dst_ex_dir)
+        cp(src_ex_dir, dst_ex_dir)
+    end
+    docs_src = joinpath(juliafem_dir, "docs", "src")
+    return relpath(dst_file, docs_src)
+end
+
+
+"""
+    get_example_files(ex_src)
+
+Return all example files from directory `examples`.
+"""
+function get_example_files(ex_src)
+    ex_flt(s) = endswith(s, ".jl") && !startswith(s, "test_")
+    return filter(ex_flt, readdir(ex_src))
+end
+
+
+"""
+    generate_examples()
+
+Generate examples using Literate.jl. Returns a vector containing pages for
+a documentation.
+"""
+function generate_examples()
+    EXAMPLES = []
+    ex_src = joinpath(juliafem_dir, "examples")
+    ex_dst = joinpath(juliafem_dir, "docs", "src", "examples")
+    for ex_file in get_example_files(ex_src)
+        example_file = joinpath(ex_src, ex_file)
+        markdown_file = generate_example(example_file, ex_dst)
+        add_page!(EXAMPLES, markdown_file)
+    end
+    return EXAMPLES
+end
+
+
+# Collect all together
+USER_GUIDE = []
+EXAMPLES = generate_examples()
+DEVELOPER = generate_developers_guide()
+PACKAGES = generate_packages()
+APIDOC = ["api.md"]
+
+PAGES = [
+    "Home" => "index.md",
+    "User's guide" => USER_GUIDE,
+    "Examples" => EXAMPLES,
+    "Developer's guide" => DEVELOPER,
+    "Description of packages" => PACKAGES,
+    "API documentation" => APIDOC
+]
+
+@info("Pages in documentation", PAGES)
+
+makedocs(modules=[JuliaFEM],
+        format = Documenter.HTML(analytics="UA-83590644-1"),
+        checkdocs = :all,
+        sitename = "JuliaFEM.jl",
+        pages = PAGES
+)
+
+include("deploy.jl")
