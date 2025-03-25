@@ -455,5 +455,238 @@ function assemble!(problem::Problem{Contact}, slave_element::Element{Tri6}, time
         end # master elements done
 
     end # sub slave elements done
+
+end
+
+"""
+Frictionless 3d small sliding contact.
+
+problem
+time
+dimension
+finite_sliding
+friction
+use_forwarddiff
+"""
+function assemble!(
+    problem::Problem{Contact},
+    time::Float64,
+    ::Type{Val{2}},
+    ::Type{Val{false}},
+    ::Type{Val{false}},
+    ::Type{Val{false}},
+)
+    props = problem.properties
+    field_dim = get_unknown_field_dimension(problem)
+    field_name = get_parent_field_name(problem)
+    slave_elements = get_slave_elements(problem)
+   
+    # 1. calculate nodal normals and tangents for slave element nodes j ∈ S
+    normals = calculate_normals(slave_elements, time, Val{2}; rotate_normals=props.rotate_normals)
+   
+    update!(slave_elements, "normal", time => normals)
+
+    # 2. loop all slave elements
+    for slave_element in slave_elements
+        assemble!(problem, slave_element, time)
+    end # slave elements done, contact virtual work ready
+
+    S = sort(collect(keys(normals)))    # slave element nodes
+    weighted_gap = Dict{Int64, Vector{Float64}}()
+    contact_pressure = Dict{Int64, Vector{Float64}}()
+    complementarity_condition = Dict{Int64, Vector{Float64}}()
+    is_active = Dict{Int64, Int}()
+    is_inactive = Dict{Int64, Int}()
+    is_slip = Dict{Int64, Int}()
+    is_stick = Dict{Int64, Int}()
+
+    la = problem.assembly.la
+
+    # FIXME: for matrix operations, you need to know the dimensions of the final matrices
+    ndofs = 0
+    ndofs = max(ndofs, size(problem.assembly.K, 2))
+    ndofs = max(ndofs, size(problem.assembly.C1, 2))
+    ndofs = max(ndofs, size(problem.assembly.C2, 2))
+    ndofs = max(ndofs, size(problem.assembly.D, 2))
+    ndofs = max(ndofs, size(problem.assembly.g, 2))
+    ndofs = max(ndofs, size(problem.assembly.c, 2))
+
+    C1 = sparse(problem.assembly.C1, ndofs, ndofs)
+    C2 = sparse(problem.assembly.C2, ndofs, ndofs)
+    D = sparse(problem.assembly.D, ndofs, ndofs)
+    g = Vector(problem.assembly.g, ndofs)
+    c = Vector(problem.assembly.c, ndofs)
+
+    maxdim = maximum(size(C1))
+    if problem.properties.alpha != 0.0
+        alp = problem.properties.alpha
+        Te = [
+            1.0 0.0 0.0 0.0 0.0 0.0
+            0.0 1.0 0.0 0.0 0.0 0.0
+            0.0 0.0 1.0 0.0 0.0 0.0
+            alp alp 0.0 1.0 -2 * alp 0.0 0.0
+            0.0 alp alp 0.0 1.0 - 2 * alp 0.0
+            alp 0.0 alp 0.0 0.0 1.0 - 2 * alp
+        ]
+        invTe = [
+            1.0 0.0 0.0 0.0 0.0 0.0
+            0.0 1.0 0.0 0.0 0.0 0.0
+            0.0 0.0 1.0 0.0 0.0 0.0
+            -alp/(1-2*alp) -alp/(1-2*alp) 0.0 1/(1-2*alp) 0.0 0.0
+            0.0 -alp/(1-2*alp) -alp/(1-2*alp) 0.0 1/(1-2*alp) 0.0
+            -alp/(1-2*alp) 0.0 -alp/(1-2*alp) 0.0 0.0 1/(1-2*alp)
+        ]
+        # construct global transformation matrices T and invT
+        T = SparseMatrixCOO()
+        invT = SparseMatrixCOO()
+        for element in slave_elements
+            dofs = get_gdofs(problem, element)
+            for i = 1 : field_dim
+                ldofs = dofs[i : field_dim : end]
+                add!(T, ldofs, ldofs, Te)
+                add!(invT, ldofs, ldofs, invTe)
+            end
+        end
+        
+        T = sparse(T, maxdim, maxdim, (a, b) -> b)
+        invT = sparse(invT, maxdim, maxdim, (a, b) -> b)
+        # fill diagonal
+        d = ones(size(T, 1))
+        d[get_nonzero_rows(T)] .= 0.0
+        T += sparse(Diagonal(d))
+        invT += sparse(Diagonal(d))
+        # invT2 = sparse(inv(full(T)))
+        # @info("invT == invT2? ", invT == invT2)
+        # maxabsdiff = maximum(abs(invT - invT2))
+        # @info("max diff = $maxabsdiff")
+        C1 = C1 * invT 
+        C2 = C2 * invT 
+    end
+
+    tol = problem.properties.drop_tolerance
+    SparseArrays.droptol!(C1, tol)
+    SparseArrays.droptol!(C2, tol)
+
+    for j in S 
+        dofs = [3*(j-1)+1, 3*(j-1)+2, 3*(j-1)+3]
+        weighted_gap[j] = g[dofs]
+    end
+
+    state = problem.properties.contact_state_in_first_iteration
+    if problem.properties.iteration == 1
+        @info("First contact iteration, initial contact state = $state")
+
+        if state == :AUTO
+            avg_gap = mean([weighted_gap[j][1] for j in S])
+            std_gap = std([weighted_gap[j][1] for j in S])
+            if (avg_gap < 1.0e-12) && (std_gap < 1.0e-12)
+                state = :ACTIVE 
+            else
+                state = :UNKNOWN 
+            end
+            @info(
+                "Average weighted gap = $avg_gap, std gap = $std_gap, automatically determined contact state = $state"
+            )
+        end
+
+    end
+
+    # active / inactive node detection
+    for j in S 
+        dofs = [3*(j-1)+1, 3*(j-1)+2, 3*(j-1)+3]
+        weighted_gap[j] = g[dofs]
+
+        if length(la) != 0
+            normal = normals[j]
+            tangent1, tangent2 = create_orthogonal_basis(normal)
+            p = dot(normal, la[dofs])
+            t1 = dot(tangent1, la[dofs])
+            t2 = dot(tangent2, la[dofs])
+            contact_pressure[j] = [p, t1, t2]
+        else
+            contact_pressure[j] = [0.0, 0.0, 0.0]
+        end
+        complementarity_condition[j] = contact_pressure[j] - weighted_gap[j]
+
+        if complementarity_condition[j][1] > 0.0
+            is_inactive[j] = 0
+            is_active[j] = 1
+            is_slip[j] = 1
+            is_stick[j] = 0
+        else
+            is_inactive[j] = 1
+            is_active[j] = 0
+            is_slip[j] = 0
+            is_stick[j] = 0
+        end
+    end
+
+    if (problem.properties.iteration == 1) && (state == :ACTIVE)
+        for j in S 
+            is_inactive[j] = 0
+            is_active[j] = 1
+            is_slip[j] = 1
+            is_stick[j] = 0
+        end
+    end
+
+    if (problem.properties.iteration == 1) && (state == :INACTIVE)
+        for j in S 
+            is_inactive[j] = 1
+            is_active[j] = 0
+            is_slip[j] = 0
+            is_stick[j] = 0
+        end
+    end
+
+    @info("# | active | stick | slip | gap | pres | comp")
+    for j in S 
+        str1 = "$j | $(is_active[j]) | $(is_stick[j]) | $(is_slip[j]) | "
+        str2 = "$(round(weighted_gap[j][1]; digits=3)) | $(round(contact_pressure[j][1]; digits=3)) | $(round(complementarity_condition[j][1]; digits=3))"
+        @info(str1 * str2)
+    end
+
+    for j in S 
+        dofs = [3*(j-1)+1, 3*(j-1)+2, 3*(j-1)+3]
+        tdofs = [3*(j-1)+2, 3*(j-1)+3]
+
+        if is_inactive[j] == 1
+            # remove inactive nodes from assembly
+            C1[dofs,:] .= 0.0
+            C2[dofs,:] .= 0.0
+            D[dofs,:] .= 0.0
+            g[dofs,:] .= 0.0
+
+        elseif (is_active[j] == 1) && (is_slip[j] == 1)
+            # contitutive modelling in tangent direction, frictionless contact
+            C2[tdofs,:] .= 0.0
+            g[tdofs] .= 0.0
+            normal = normals[j]
+            tangent1, tangent2 = create_orthogonal_basis(normal)
+            D[tdofs[1], dofs] .= tangent1
+            D[tdofs[2], dofs] .= tangent2
+        end
+    end
+
+    problem.assembly.C1 = C1
+    problem.assembly.C2 = C2
+    problem.assembly.D = D 
+    problem.assembly.g = g 
+
+end
+
+function postprocess!(problem::Problem{Contact}, time::Float64, ::Type{Val{Symbol("contact pressure")}})
+    n = problem("normal", time)
+    la = problem("lambda", time)
+    node_ids = keys(n)
+    cp = Dict(nid => dot(n[nid], la[nid]) for nid in node_ids)
     
+    # FIXME: have to define zero contact pressure & lambda to master elements
+    # elements because interface.elements = [slave_elements; master_elements]
+    for nid in keys(la)
+        if !haskey(cp, nid)
+            cp[nid] = 0.0
+        end
+    end
+    update!(problem, "contact pressure", time => cp)
 end
