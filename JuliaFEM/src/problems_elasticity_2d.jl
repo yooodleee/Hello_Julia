@@ -250,5 +250,5 @@ function assemble(
 
     end
 
-    return Km Kg, f
+    return Km, Kg, f
 end
