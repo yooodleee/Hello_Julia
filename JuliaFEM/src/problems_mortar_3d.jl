@@ -280,3 +280,250 @@ function check_orientation!(P, n)
     end)
 end
 
+function convert_to_linear_element(element::Element{E}) where E 
+    return element
+end
+
+function convert_to_linear_element(element::Element{Tri6})
+    new_element = Element(Tri3, element.connectivity[1:3])
+    new_element.id = element.id
+    new_element.fields = element.fields
+    return new_element
+end
+
+function split_quadratic_element(element::Element{E}, time::Float64) where E 
+    return [element]
+end
+
+function split_quadratic_element(element::Element{Tir6}, time::Float64)
+    element_maps = Vector{Int}[[1,4,6], [4,5,6], [4,2,5], [6,5,3]]
+    new_elements = Element[]
+    connectivity = get_connectivity(element)
+    for elmap in element_maps
+        new_element = Element(Tri3, connectivity[elmap])
+        X = element("geometry", time)
+        update!(new_element, "geometry", time => X[elmap])
+        if haskey(element, "displacement")
+            u = element("displacement", time)
+            update!(new_element, "displacement", time => u[elmap])
+        end
+
+        if haskey(element, "normal")
+            n = element("normal", time)
+            update!(new_element, "normal", time => n[elmap])
+        end
+        push!(new_elements, new_element)
+    end
+    return new_elements
+end
+
+function split_quadratic_elements(elements::DVTI, time::FLoat64)
+    return DVTI(split_quadratic_elements(elements.data, time))
+end
+
+""" Split quadratic surface elements to linear elements. """
+function split_quadratic_elements(elements::Vector, time::FLoat64)
+    new_elements = Element[]
+    for element in elements
+        for splitted_element in split_quadratic_element(element, time)
+            push!(new_elements, splitted_element)
+        end
+    end
+    n1 = length(elements)
+    n2 = length(new_elements)
+    if n1 != n2 
+        @info("Splitted $n1 elements to $n2 (linear) sub-elements")
+    end
+    return new_elements
+end
+
+function get_mean_xi(element::Element)
+    xi = zeros(2)
+    coords = get_reference_coordinates(element)
+    for (xi1, xi2) in coords
+        xi[1] += xi1
+        xi[2] += xi2 
+    end
+    xi /= length(coords)
+    return xi 
+end
+
+""" Assemble linear surface element to problem.
+
+Dual basis is constructed suth that partially integrated slave segments are taken 
+into account in a proper way.
+
+Notes
+---------
+For full integrated slave element, coefficient matrix for Tri3 is 
+Ae = [3.0 -1.0 -1.0; -1.0 3.0 -1.0; -1.0 -1.0 3.0]
+
+References
+-----------
+
+[Prop2013] Propp, Alexander, et al.
+"Imporved robustness and consistency of 3D contact algorithms based on a dual mortar approach."
+Computer Methods in Applied Mechanics and Enginnering 264 (2013): 67-80.
+"""
+function assemble!(
+    problem::Problem{Mortar},
+    slave_element::Element{E},
+    time::Real,
+    first_slave_element=false
+) where E<:Union{Tri3, Quad4}
+    
+    props = problem.properties
+    field_dim = get_unknown_field_dimension(problem)
+    field_name = get_parent_field_name(problem)
+    area = 0.0
+
+    slave_element_nods = get_connectivity(slave_element)
+    nsl = length(slave_element)
+    X1 = slave_element("geometry", time)
+    n1 = slave_element("normal", time)
+
+    # project slave nodes to auxiliary plane (x0, Q)
+    xi = get_mean_xi(slave_element)
+    N = vec(get_basis(slave_element, xi, time))
+    x0 = interpolate(N, X1)
+    n0 = interpolate(N, n1)
+    S = Vector[project_vertex_to_auxiliary_plane(X1[i], x0, n0) for i=1:nsl]
+
+    master_elements = slave_element("master elements", time)
+
+    if props.dual_basis
+
+        De = zeros(nsl, nsl)
+        Me = zeros(nsl, nsl)
+
+        for master_element in master_elements
+            master_element_nodes = get_connectivity(master_element)
+            nm = length(master_element)
+            X2 = master_element("geometry", time)
+
+            if norm(mean(X1) - mean(X2)) > problem.properties.distval
+                continue
+            end
+
+            # 3.1 proejct master nodes to auxiliary plane and create polygon clipping
+            M = Vector[project_vertex_to_auxiliary_plane(X2[i], x0, n0) for i=1:nm]
+            P = get_polygon_clip(X, M, n0)
+            length(P) < 3 && continue   # no clipping or shared edge (no volume)
+            check_orientation!(P, n0)
+            N_P = length(P)
+            P_area = sum([norm(1/2*cross(P[i]-P[1], P[mod(i,N_P)+1]-P[1])) for i=2:N_P])
+
+            if isapprox(P_area, 0.0)
+                @info("Polygon P has zero area: $P_area")
+                continue
+            end
+
+            # 4. loop intergration cells 
+            C0 = calculate_centroid(P)
+            all_cells = get_cells(P, C0)
+            for cell in all_cells
+                virtual_element = Element(Tri3, Int[])
+                update!(virtual_element, "geometry", tuple(cell...))
+                for ip in get_integration_points(virtual_element, 3)
+                    detJ = virtual_element(ip, time, Val{:detJ})
+                    w = ip.weight * detJ 
+                    x_gauss = virtual_element("geometry", ip, time)
+                    xi_s, alpha = project_vertex_to_surface(x_gauss, x0, n0, slave_element, X1, time)
+                    N1 = slave_element(xi_s, time)
+                    De += w * Matrix(Diagonal(vec(N1)))
+                    Me += w * N1' * N1 
+                end
+            end # integration cells done 
+
+        end # master elements done 
+
+        Ae - De * inv(Me)
+
+        @info("Dual basis coefficient matrix: $Ae")
+    else
+        Ae = Matrix(1.0I, nsl, nsl)
+    end
+
+    for master_element in master_elements
+        master_element_nodes = get_connectivity(master_element)
+        nm = length(master_element)
+        X2 = master_element("geometry", time)
+
+        if norm(mean(X1) - mean(X2)) > problem.properties.distval 
+            continue
+        end
+
+        # 3.1 project master nodes to auxiliary plane and create polygon clipping 
+        M = Vector[project_vertex_to_auxiliary_plane(X2[i], x0, n0) for i=1:nm]
+        P = get_polygon_clip(X, M, n0)
+        length(P) < 3 && continue   # no clipping or shared edge (no volume)
+        check_orientation!(P, n0)
+        N_P = length(P)
+        P_area = sum([norm(1/2*cross(P[i]-P[1], P[mod(i,N_P)+1]-P[1])) for i=2:N_P])
+
+        if isapprox(P_area, 0.0)
+            @info("Polygon P has zero area: $P_area")
+            continue
+        end
+
+        C0 = calculate_centroid(P)
+
+        De = zeros(nsl, nsl)
+        Me = zeros(nsl, nm)
+        ge = zeros(field_dim * nsl)
+
+        # 4. loop integration cells 
+        all_cells = get_cells(P, C0)
+        for cell in all_cells 
+            virtual_element = Element(Tri3, Int[])
+            update!(virtual_element, "geometry", tuple(cell...))
+
+            # 5. loop integration point of integration cell 
+            for ip in get_integration_points(virtual_element, 3)
+                detJ = virtual_element(ip, time, Val{:detJ})
+                w = ip.weight * detJ 
+
+                # project gauss point from auxiliary plane to master and slave element 
+                x_gauss = virtual_element("geometry", ip, time)
+
+                xi_s, alpha = project_vertex_to_surface(x_gauss, x0, n0, slave_element, X1, time)
+                xi_m, alpha = project_vertex_to_surface(x_gauss, x0, n0, master_element, X2, time)
+
+                # add contributions
+                N1 = vec(get_basis(slave_element, xi_s, time))
+                N2 = vec(get_basis(master_element, xi_m, time))
+                Phi = Ae * N1 
+                # Phi = [3.0-4.0 * xi_s[i]-4.0 * xi_s[2], 4.0 * xi_s[1]-1.0, 4.0 * xi_s[2]-1.0]
+                De += w * Phi * N1'
+                Me += w * Phi * N2'
+                if props.adjust && haskey(slave_element, "displacement") && haskey(master_element, "displacement")
+                    u1 = slave_element("displacement", time)
+                    u2 = master_element("displacement", time)
+                    x_s = interpolate(N1, map(+, X1, u1))
+                    x_m = interpolate(N2, map(+, X2, u2))
+                    ge += w * vec((x_m - x_s) * Phi')
+                end
+                area += w 
+            end # integration points done 
+            
+        end # integration cells done 
+
+        # 6. add contribution to contact virtual work
+        sdofs = get_gdofs(problem, slave_element)
+        mdofs = get_gdofs(problem, master_element)
+
+        for i=1:field_dim
+            lsdofs = sdofs[i:field_dim:end]
+            lmdofs = mdofs[i:field_dim:end]
+            add!(problem.assembly.C1, lsdofs, lsdofs, De)
+            add!(problem.assembly.C2, lsdofs, lmdofs, -Me)
+            add!(problem.assembly.C2, lsdofs, lsdofs, De)
+            add!(problem.assembly.C2, lsdofs, lmdofs, _Me)
+        end
+        add!(problem.assembly.g, sdofs, ge)
+
+    end # master elements done 
+
+    return area 
+end
+
