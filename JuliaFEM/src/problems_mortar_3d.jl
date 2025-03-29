@@ -782,3 +782,93 @@ function assemble!(
     return area
 end
 
+function assemble!(problem::Problem{Mortar}, time::Real, ::Type{Val{2}}, ::Type{Val{false}})
+
+    props = problem.properties
+    field_dim = get_unknown_field_dimension(problem)
+    field_name = get_parent_field_name(problem)
+    slave_elements = get_slave_elements(problem)
+    area = 0.0
+
+    #=
+    if props.split_quadratic_elements
+        if !props.linear_surface_elements
+            @warn("Mortar3D: split_quadratic_surfaces = true and linear_surface_elements = false maybe have unexpected behavior")
+        end
+        slave_elements = split_quadratic_elements(slave_elements, time)
+    end
+    =#
+
+    #1. calculate nodal normals and tangets for slave element nodes j ∈  S
+    normals = calcuate_normals(
+        slave_elements, time, Val{2};
+        rotate_normals=props.rotate_normals
+    )
+
+    update!(slave_elements, "normal", time => normals)
+
+    # 2. loop all slave elements
+    first_slave_element = true
+
+    for slave_element in slave_elements
+        area += assemble!(problem, slave_element, time; first_slave_element=first_slave_element)
+        first_slave_element = false
+    
+    end # slave elements done, contact virtual work ready
+
+    C1 = sparse(problem.assembly.C1)
+    C2 = sparse(problem.assembly.C2)
+
+    maxdim = maximum(size(C1))
+    if problem.properties.alpha != 0.0
+        alp = problem.properties.alpha
+        Te = [
+            1.0 0.0 0.0 0.0 0.0 0.0
+            0.0 1.0 0.0 0.0 0.0 0.0
+            0.0 0.0 1.0 0.0 0.0 0.0
+            alp alp 0.0 1.0-2*alp 0.0 0.0
+            0.0 alp alp 0.0 1.0-2*alp 0.0
+            alp 0.0 alp 0.0 0.0 1.0-2*alp
+        ]
+        invTe = [
+            1.0 0.0 0.0 0.0 0.0 0.0 
+            0.0 1.0 0.0 0.0 0.0 0.0
+            0.0 0.0 1.0 0.0 0.0 0.0
+            -alp/(1-2*alp) -alp/(1-2*alp) 0.0 1/(1-2*alp) 0.0 0.0
+            0.0 -alp/(1-2*alp) -alp/(1-2*alp) 0.0 1/(1-2*alp) 0.0
+            -alp/(1-2*alp) 0.0 -alp/(1-2*alp) 0.0 0.0 1/(1-2*alp)
+        ]
+        # construct global transformation matrices T and invT
+        T = SparseMatrixCOO()
+        invT = SparseMatrixCOO()
+        for element in slave_elements
+            dofs = get_gdofs(problem, element)
+            for i=1:field_dim
+                ldofs = dofs[i:field_dim:end]
+                add!(T, ldofs, ldfos, Te)
+                add!(invT, ldofs, ldofs, invTe)
+            end
+        end
+        T = sparse(T, maxdim, maxdim, (a, b) -> b)
+        invT = sparse(invT, maxdim, maxdim, (a, b) -> b)
+        # fill diagonal
+        d = ones(size(T, 1))
+        d[get_nonzero_rows(T)] .= 0.0
+        T += sparse(Diagonal(d))
+        invT += sparse(Diagonal(d))
+        # invT2 = sparse(inv(full(T)))
+        # @info("invT == invT2? ", invT == invT2)
+        # maxabsdiff = maximum(abs(invT - invT2))
+        # @info("max diff = $maxabsdiff")
+        C1 = C1 * invT
+        C2 = C2 * invT
+    end
+
+    tol = problem.properties.drop_tolerance
+    SparseArrays.droptol!(C1, tol)
+    SparseArrays.droptol!(C2, tol)
+
+    problem.assembly.C1 = C1
+    problem.assembly.C2 = C2
+
+end
