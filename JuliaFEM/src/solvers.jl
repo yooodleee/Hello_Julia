@@ -248,3 +248,27 @@ function solve!(solver::Solver, K, C1, C2, D, f, g, u, la, ::Type{Val{2}})
 
     return true
 end
+
+
+"""Solve linear system using LU factorization (UMFPACK). This version solves
+directly the saddle point problem without elimination of boundary conditions.
+If matrix has zero rows, diagonal term is added to that matrix is invertible.
+"""
+function solve!(solver::Solver, K, C1, C2, D, f, g, u, la, ::Type{Val{3}})
+    A = [K C1' ; C2 D]
+    b = [f; g]
+
+    ndofs = size(K, 2)
+    nonzero_rows = zeros(2 * ndofs)
+    for j in rowvals(A)
+        nonzero_rows[j] = 1.0
+    end
+
+    A += sparse(Diagonal(1.0 .- nonzero_rows))
+    x = lu(A) \ Vector(b[:])
+
+    u[:] .= x[1:ndofs]
+    la[:] .= x[ndofs+1:end]
+
+    return true
+end
