@@ -349,3 +349,42 @@ function solve!(solver::Solver; empty_assemble_before_solution=true, symmetric=t
 
     return u, la 
 end
+
+
+"""assemble!(solver; with_mass_matrix=false)
+
+Default assembler for solver.
+
+This function loops over all problems defined in problem and launches
+standard assembler for them. As a result, each problem.assembly is 
+populated with global stiffness matrix, force vector, and, optionally,
+mass matrix.
+"""
+function assemble!(solver::Solver, time::Float64; with_mass_matrix=false)
+    @info("Assembling problems ...")
+
+    for problem in get_problems(solver)
+        timeit("assemble $(problem.name)") do 
+            empty!(problem.assembly)
+            assemble!(problem, time)
+        end
+    end
+
+    if with_mass_matrix
+        for problem in get_field_problems(solver)
+            timeit("assemble $(problem.name) mass matrix") do 
+                assemble!(problem, time, Val{:mass_matrix})
+            end
+        end
+    end
+
+    #=
+    ndofs = 0
+    for problem in solver.problems
+        Ks = size(problem.assembly.K, 2)
+        Cs = size(problem.assembly.C1, 2)
+        ndofs = max(ndofs, Ks, Cs)
+    end
+    solver.ndofs = ndofs
+    =#
+end
