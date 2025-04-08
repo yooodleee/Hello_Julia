@@ -220,3 +220,31 @@ function solve!(solver::Solver, K, C1, C2, D, f, g, u, la, ::Type{Val{1}})
 
     return true
 end
+
+
+"""Solve linear system using LU factorization (UMFPACK). This verson solves
+directly the saddle point problem without elimination of boundary conditions.
+It is assumed that C1 == C2 and D = 0, so problem is symmetric and zero rows
+cand be removed from total system before solution. This kind of system arises
+in e.g. mesh tie problem
+"""
+function solve!(solver::Solver, K, C1, C2, D, f, g, u, la, ::Type{Val{2}})
+    C1 == C2 || return false
+    length(D) == 0 || return false
+
+    A = [K C1' ; C2 D]
+    b = [f; g]
+    ndofs = size(K, 2)
+
+    nz1 = get_nonzero_rows(A)
+    nz2 = get_nonzero_columns(A)
+    nz1 == nz2 || return false
+
+    x = zeros(2 * ndofs)
+    x[nz1] = lufact(A[nz1, nz2]) \ full(b[nz1])
+
+    u[:] = x[1:ndofs]
+    la[:] = x[ndofs+1:end]
+
+    return true
+end
