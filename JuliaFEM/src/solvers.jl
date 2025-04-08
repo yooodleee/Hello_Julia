@@ -272,3 +272,80 @@ function solve!(solver::Solver, K, C1, C2, D, f, g, u, la, ::Type{Val{3}})
 
     return true
 end
+
+
+"""Default linear system solver for solver."""
+function solve!(solver::Solver; empty_assemble_before_solution=true, symmetric=true)
+    @info("Solving linear system.")
+    t0 = Base.time()
+
+    # assemble field & boundary problems
+    # TODO: return same kind of set for both assembly types
+    # M1, K1, Kg1, f1, C11, C21, D1, g1 = get_field_assembly(solver)
+    # M2, K2, Kg2, f2, C12, C22, D2, g2 = get_boundary_assembly(solver)
+
+    M, K, Kg, f, fg = get_field_assembly(solver)
+    N = size(K, 2)
+    Kb, C1, C2, D, fb, g = get_boundary_assembly(solver, N)
+    K = K + Kg + Kb
+    f = f + fg + fb
+
+    if symmetric
+        K = 1 / 2 * (K + K')
+        M = 1 / 2 * (M + M')
+    end
+
+    if empty_assemble_before_solution
+        # free up some memory before solution by emptying field assembiles from problems
+        for problem in get_field_assembly(solver)
+            empty!(problem.assembly)
+        end
+    end
+
+    #=
+    if !haskey(solver, "fint")
+        solver.field["fint"] = field(solver.time => f)
+    else
+        update!(solver.fields["fint"], solver.time => f)
+    end
+
+    fint = solver.fields["fint"]
+
+    if length(fint) > 1
+        # kick in generalized alpha rule for time integration
+        alpha = solver.alpha
+        K = (1 - alpha) * K
+        C1 = (1 - alpha) * C1
+        f = (1 - alpha) * f + alpha * fint.data[end - 1].second
+    end
+    =#
+
+    ndofs = N 
+    u = zeros(ndofs)
+    la = zeros(ndofs)
+    is_solved = false
+    local i 
+    for i in [1, 2, 3]
+        is_solved = solve!(solver, K, C1, C2, D, f, g, u, la, Val{i})
+        if is_solved
+            t1 = round(Base.time() - t0; digits=2)
+            norms = (norm(u), norm(la))
+            @info(
+                "Solved linear system in $t1 seconds using solver $i. Solution norms (||u||, ||la||): $norms."
+            )
+            break
+        end
+    end
+
+    if !is_solved
+        error("Failed to solve linear system!")
+    end
+
+    # push!(solver.norms, norms)
+    # solver.u = u
+    # solver.la = la
+
+    @info("")
+
+    return u, la 
+end
