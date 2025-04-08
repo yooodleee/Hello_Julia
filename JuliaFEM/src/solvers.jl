@@ -190,3 +190,33 @@ function get_boundary_assembly(solver::Solver, N)
     return K, C1, C2, D, f, g 
 
 end
+
+
+"""Solve linear system using LDLt factorization (SuiteSparse). 
+This version requires that final system is symmetric and positive
+definite, so boundary conditions are first eliminated before solution.
+"""
+function solve!(solver::Solver, K, C1, C2, D, f, g, u, la, ::Type{Val{1}})
+    nnz(D) == 0 || return false
+
+    A = get_nonzero_rows(K)
+    B = get_nonzero_rows(C2)
+    B2 = get_nonzero_columns(C2)
+    B == B2 || return false
+    I = setdiff(A, B)
+
+    if length(B) == 0
+        @warn("No rows, in C2, forget to set Dirichlet boundary conditions to model?")
+    else
+        u[B] = lu(C2[B, B2]) \ Vector(g[B])
+    end
+
+    # Solve lagrante domain using LDLt factorization
+    F = ldlt(K[I, I])
+    u[I] = F \ vector(f[I] - K[I, B] * u[B])
+
+    # Solve lagrange multipliers
+    la[B] = lu(C1[B2, B]) \ Vector(f[B] - K[B, I] * u[I] - K[B, B] * u[B])
+
+    return true
+end
