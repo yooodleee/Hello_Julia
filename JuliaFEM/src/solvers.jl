@@ -388,3 +388,154 @@ function assemble!(solver::Solver, time::Float64; with_mass_matrix=false)
     solver.ndofs = ndofs
     =#
 end
+
+function get_unknown_fields(solver::Solver)
+    fields = Dict()
+    for problem in get_field_problems(solver)
+        field_name = get_unknown_field_name(problem)
+        field_dim = get_unknown_field_dimension(problem)
+        fields[field_name] = field_dim
+    end
+    return fields
+end
+
+function get_unknown_field_name(solver::Solver)
+    fields = get_unknown_fields(solver)
+    return join(sort(collect(keys(fields))), ", ")
+end
+
+function get_unknown_field_dimension(solver::Solver)
+    fields = get_unknown_fields(solver)
+    return sum(values(fields))
+end
+
+""" Default initializer for solver. """
+function initialize!(solver::Solver)
+    if solver.initialized
+        @warn("initialize!(): solver already initialized")
+        return
+    end
+    @info("Initializing solver ...")
+    problems = get_problems(solver)
+    length(problems) != 0 || error("Empty solver, add problems to solver using path!")
+    t0 = Base.time()
+    field_problems = get_field_problems(solver)
+    length(field_problems) != 0 || @warn("No field problem found from solver, add some..?")
+    field_name = get_unknown_field_name(solver)
+    field_dim = get_unknown_field_dimension(solver)
+    @info("initialize!(): looks we are solving $field_name, $field_dim dofs/node")
+    nodes = Set{Int64}()
+    for problem in problems
+        initialize!(problem, solver.time)
+        for element in get_elements(problem)
+            conn = get_connectivity(element)
+            push!(nodes, conn...)
+        end
+    end
+    nnodes = length(nodes)
+    @info("Total number of nodes in problems: $nnodes")
+    maxdof = maximum(nodes) * field_dim
+    @info("# of max dof (=size of solution vector) is $maxdof")
+    solver.u = zeros(maxdof)
+    solver.la = zeros(maxdof)
+    # TODO: this could be used to initialize elements too...
+    # TODO: cannot initialize to zero always, construct vector from elements.
+    for problem in problems
+        problem.assembly.u = zeros(maxdof)
+        problem.assembly.la = zeros(maxdof)
+        # initialize(problem, ....)
+    end
+    t1 = round(Base.time() - t0; digits=2)
+    @info("Initialized solver in $t1 seconds.")
+    solver.initialized = true
+end
+
+function get_all_elements(solver::Solver)
+    elements = [get_elements(problem) for problem in get_problems(solver)]
+    return [elements...;] 
+end
+
+"""
+Return nodal field from all problems defined in solver.
+
+Examples
+-----------
+To return e.g. geometry defined in nodal points at time t=0.0, one can write:
+
+julia> solver("geometry", 0.0)
+"""
+function (solver::Solver)(field_name::String, time::Float64)
+    fields = []
+    for problem in get_problems(solver)
+        field = problem(field_name, time)
+        if field == nothing
+            continue
+        end
+        if length(field) == 0
+            @warn("no field $field_name found for problem $(problem.name)")
+            continue
+        end
+        push!(fields, field)
+    end
+    if length(fields) == 0
+        return Dict{Integer, Vector{Float64}}()
+    end
+    return merge(fields...)
+end
+
+function update!(solver::Solver{S}, u, la, time) where S
+    for problem in get_problems(solver)
+        assembly = get_assembly(problem)
+        elements = get_elements(problem)
+        # update solution, first for assembly (u, la)...
+        update!(problem, assembly, u, la)
+        # .. and then from assembly (u, la) to elements
+        update!(problem, assembly, elements, time)
+    end
+end
+
+""" Default postprocess for solver. Loop all probs and run postprocess
+funcs to calculate secondary fields, i.e. contact pressure, stress, 
+heat flux, reaction force etc. quantities.
+"""
+function postprocess!(solver::Solver, time)
+    problems = get_problems(solver)
+    nproblems = length(problems)
+    @info("Postprocessing $nproblems problems.")
+    for problem in problems
+        for field_name in problem.postprocess_fields
+            field = val{Symbol(field_name)}
+            @info("Running postprocess for problem $(problem.name), field $field_name")
+            postprocess!(problem, time, field)
+        end
+    end
+end
+
+"""
+    write_results!(solver, time)
+
+Default xdmf update for solver. Loop all problems and write them individually
+to Xdmf file. By default write the main unknown field (displacement, temperature,
+...) and any fields requested separately in `problem.postprocess_fields` vector
+(stress, strain, ...)
+"""
+function write_results!(solver, time)
+    results_writers = get_results_writers(solver)
+    if length(results_writers) == 0
+        @info("No result writers are attached to analysis, not writing output.")
+        @info("To write results to Xdmf file, attach Xdmf to analysis, i.e.")
+        @info("xdmf_output = Xdmf(\"simulation_results\")")
+        @info("add_results_writer!(analysis, xdmf_output)")
+        return
+    end
+    # FIXME: result writer can be anything, not only Xdmf
+    for xdmf in results_writers
+        for problem in get_problems(solver)
+            fields = [get_unknown_field_dimension(problem); problem.postprocess_fields]
+            if is_boundary_problem(problem)
+                fields = [fields; get_parent_field_name(problem)]
+            end
+            update_xdmf!(xdmf, problem, time, fields)
+        end
+    end
+end
