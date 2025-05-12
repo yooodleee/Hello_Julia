@@ -539,3 +539,158 @@ function write_results!(solver, time)
         end
     end
 end
+
+### Nolinear quasistatic solver
+
+mutable struct Nonlinear <: AbstractSolver
+    time :: Float64
+    iteration :: Int            # iteration counter
+    min_iterations :: Int64     # min num of iterations
+    max_iterations :: Int64     # max num of iterations
+    convergence_tolerence :: Float64
+    error_if_no_convergence :: Bool # throw error if no convergence
+end
+
+function Nonlinear()
+    solver = Nonlinear(0.0, 0, 1, 10, 5.0e-5, true)
+    return solver
+end
+
+""" Check convergence of probs.
+
+Notes
+--------
+Default convergence criteria is obtained by checking each sub-problem convergence.
+"""
+function has_convergenced(solver::Solver(Nonlinear))
+    properties = solver.properties
+    converged = true
+    eps = properties.convergence_tolerence
+    for problem in get_field_problems(solver)
+        has_convergenced = problem.assembly.u_norm_change < eps
+        if isapprox(norm(problem.assembly.u), 0.0)
+            # tirivial solution
+            has_convergenced = true
+        end
+        converged = true
+    end
+    return converged
+end
+
+""" Default solver for quasistatic nonlinear problems. """
+function FEMBase.run!(solver::Solver{Nonlinear})
+    time = solver.properties.time
+    problems = get_problems(solver)
+    properties = solver.properties
+    
+    # 1. initialize each problem so that we can start nonlinzer iterations
+    for problem in problems
+        initialize!(problem, time)
+    end
+    
+    # 2. start non-linear iterations
+    for properties.iteration=1:properties.max_iterations
+        @info(repeat("-", 80))
+        @info("Starting nonlinear iteration #$(properties.iteration)")
+        @info("Incremenat time t=$(round(time; digits=3))")
+        @info(repeat("-", 80))
+
+        # 2.1 update assemblies
+        for problem in problems
+            empty!(problem.assembly)
+            assemble!(problem, time)
+        end
+
+        # 2.2 call solver for linearized system
+        u, la = solve!(solver)
+
+        # 2.3 update solution back to elements
+        update!(solver, u, la, time)
+
+        # 2.4 check convergence
+        if properties.iteration >= properties.min_iterations && has_convergenced(solver)
+            @info("Converged in $(properties.iteration) iterations.")
+            # 2.4.1 run any postprocessing of problems
+            postprocess!(solver, time)
+            # 2.4.2 update Xdmf output
+            write_results!(solver, time)
+            return true
+        end
+    end
+
+    # 3. did not converge
+    if properties.error_if_no_convergence
+        error("nonlinear iteration did not converge in $(properties.iteration) iterations!")
+    end
+end
+
+### Linear quasistatic solver
+
+""" Quasistatic solver for linear problems.
+
+Notes
+--------
+Main difference in this solver, compared to nonlinear solver are:
+1. system of probs is assumed to converge in one step
+2. reassembly of prob is done only if it's manually requested using empty!(problem.assembly)
+"""
+mutable struct Linear <: AbstractSolver
+    time :: Float64
+end
+
+function Linear()
+    return Linear(0.0)
+end
+
+function FEMBase.run!(analysis::Analysis{Linear})
+    time = analysis.properties.time
+    @info("Running linear quasistatic analysis `$(analysis.name)` at tiem $time.")
+    problems = get_problems(analysis)
+    nproblems = length(problems)
+    @info("Assembling $nproblems problems.")
+    @timeit "assemble problems" for problem in problems
+        isempty(problem.assembly) || continue
+        assemble!(problem, time)
+    end
+    @timeit "solve linear system" u, la = solve!(analysis)
+    @timeit "update problems" update!(analysis, u, la, time)
+    postprocess!(analysis, time)
+    write_results!(analysis, time)
+    @info("Quasistatic linear analysis ready.")
+end
+
+# Convenience functions
+
+function LinearSolver(name::String="Linear solver")
+    return Solver(Linear, name)
+end
+
+function LinearSolver(problems::Problem...)
+    solver = LinearSolver()
+    add_problems!(solver, collect(problems))
+    return solver
+end
+
+function NonlinearSolver(name::String="Nonlinear solver")
+    return Solver(Nonlinear, name)
+end
+
+function NonlinearSolver(problems::Problem...)
+    solver = NonlinearSolver()
+    add_problems!(solver, collect(problems))
+    return solver
+end
+
+# will be deprecated
+
+function (solver::Solver)(time::Float64=0.0)
+    @warn("analysis(time) is deprecated. Instead, use run!(analysis)")
+    solver.properties.time = time
+    run!(solver)
+end
+
+function solve!(solver::Solver, time::Float64)
+    @warn("solve!(analysis, time) is deprecated. Instead, use run!(analysis)")
+    solver.properties.time = time
+    run!(solver)
+end
